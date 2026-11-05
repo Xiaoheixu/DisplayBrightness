@@ -1,51 +1,43 @@
-# DisplayBrightness
+DisplayBrightness
+=================
 
 [简体中文](README.zh-CN.md)
 
-A Lilu plugin that brings native macOS brightness controls to compatible external monitors through DDC/CI.
+A Lilu plugin providing native macOS brightness control for compatible external monitors through DDC/CI.
 
 #### Features
 
-- Native controls in System Settings, Control Center and keyboard brightness keys.
-- Detects live VCP 0x10 brightness capabilities without a monitor-model allowlist.
-- Scales brightness to the monitor's reported maximum and synchronizes hardware brightness with the system slider.
-- No companion app or background service required.
-
-#### Requirements
-
-- x86_64 macOS and [Lilu](https://github.com/acidanthera/Lilu) 1.7.3 or later.
-- Currently limited to **Darwin 25.6 and a specific IOGraphics UUID**. Other macOS builds are not supported automatically.
-- A monitor with DDC/CI brightness support and a working IOFramebuffer I2C path through the GPU driver and connection. Enable DDC/CI in the monitor menu if available.
-- Compatibility with other hardware, adapters, sleep/wake, hot-plug and multiple monitors is not guaranteed.
+- Native brightness controls in Control Center, System Settings, and keyboard brightness keys.
+- Live DDC/CI VCP 0x10 capability detection without a monitor-model allowlist.
+- Brightness scaling based on the monitor's reported maximum, with hardware readback and slider synchronization.
+- Automatic startup without a companion application or background service.
 
 #### Installation
 
-1. Download the kext ZIP from [Releases](https://github.com/Xiaoheixu/DisplayBrightness/releases) and extract `DisplayBrightness.kext`.
-2. Back up your EFI, `config.plist` and previous kext. Keep a bootable recovery option.
-3. Copy the kext to `EFI/OC/Kexts/`, alongside a compatible `Lilu.kext`.
-4. Add and enable the following entry under OpenCore `Kernel -> Add`, **after Lilu**. If an entry already exists, replace the kext without adding a duplicate.
+Install `DisplayBrightness.kext` together with [Lilu](https://github.com/acidanthera/Lilu) **1.7.3 or later**.
 
-| Field | Value |
-| --- | --- |
-| BundlePath | `DisplayBrightness.kext` |
-| ExecutablePath | `Contents/MacOS/DisplayBrightness` |
-| PlistPath | `Contents/Info.plist` |
-| Enabled | `True` |
+Place the kext in `EFI/OC/Kexts` and enable it under OpenCore `Kernel -> Add`, after Lilu. Save the configuration and reboot. Back up your EFI and existing configuration before making changes.
 
-5. Save the configuration and reboot.
-
-#### Usage
-
-Open **System Settings → Displays** or **Control Center → Display**, or use the keyboard brightness keys. Check that physical monitor brightness changes and the slider stays synchronized. No extra app needs to be opened.
-
-The UI range of 0–100 is a percentage of the monitor's reported maximum. Zero does not necessarily turn the backlight off. Multi-monitor keyboard targeting is not guaranteed.
+Prebuilt binaries are distributed through [Releases](https://github.com/Xiaoheixu/DisplayBrightness/releases).
 
 #### Configuration
 
 - No plugin-specific boot argument is required for normal operation.
-- Add `-dboff` to your OpenCore boot arguments to disable the plugin; save and reboot. Remove it to enable the plugin again.
-- You can also disable its `Kernel -> Add` entry. To roll back, restore your own previous kext and configuration, then reboot using your recovery option if needed.
+- Add `-dboff` to disable the plugin. Changes take effect after rebooting.
+- Enable DDC/CI in the monitor's settings if that option is available.
 
-If controls are missing, check Lilu and plugin entries, load order, `-dboff`, the supported system ABI, monitor DDC/CI settings and connection path.
+After rebooting, use the native brightness controls to adjust the monitor. To roll back, disable the plugin's `Kernel -> Add` entry or restore your previous kext and configuration, then reboot.
 
-Please report problems through [Issues](https://github.com/Xiaoheixu/DisplayBrightness/issues).
+#### Peculiarities
+
+- x86_64 only. Currently restricted to **Darwin 25.6 and a specific IOGraphics UUID** for ABI compatibility.
+- Requires a working **IOFramebuffer I2C** communication path. DDC/CI support on the monitor alone does not guarantee compatibility with the GPU driver, cable, or adapter.
+- Other hardware, sleep/wake, hot-plug, and multi-monitor configurations remain unverified.
+- The system slider uses a normalized percentage. A value of zero does not necessarily turn off the physical backlight.
+
+This is a test prerelease. Please report problems through [Issues](https://github.com/Xiaoheixu/DisplayBrightness/issues).
+
+#### Credits
+
+- [Acidanthera](https://github.com/acidanthera) and the [Lilu contributors](https://github.com/acidanthera/Lilu/graphs/contributors) for Lilu.
+- [MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) for kernel headers and libraries.

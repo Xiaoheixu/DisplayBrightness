@@ -1,0 +1,22 @@
+# Publish only the current source and redistributable dependencies.
+/*
+!/.gitignore
+!/README.md
+!/README.zh-CN.md
+!/RELEASE-NOTES.md
+!/LICENSE-Lilu.txt
+!/driver/
+/driver/*
+!/driver/Info.plist
+!/driver/README.zh-CN.md
+!/driver/build.sh
+!/driver/src/
+!/driver/tests/
+!/driver/vendor/
+!/driver/docs/
+/driver/docs/*
+!/driver/docs/GENERAL-DETECTION.zh-CN.md
+!/driver/docs/VALIDATION.zh-CN.md
+.DS_Store
+__pycache__/
+*.pyc

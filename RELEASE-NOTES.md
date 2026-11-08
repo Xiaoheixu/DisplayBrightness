@@ -1,21 +1,25 @@
-# DisplayBrightness v0.0.28-debug.1
+## DisplayBrightness 0.0.4
 
-## 中文
+This prerelease adds external-monitor DDC/CI compatibility improvements, additional macOS profiles, and startup diagnostics. Compatible monitors use the native macOS brightness controls to adjust hardware brightness.
 
-首个测试预发布。通过 DDC/CI 为外接显示器提供 macOS 原生亮度控制入口，正常自动启用，`-dboff` 可禁用。
+### Added
 
-仅支持 x86_64，依赖 Lilu 1.7.3+，当前受 Darwin 25.6 / 指定 IOGraphics UUID 限制，显示器及连接链路须支持可用的 DDC/CI 通信。不保证其他硬件、睡眠唤醒、热插拔和多屏可用。
+- DDC/CI reply-mode fallback for external-display interfaces that advertise framed replies. A failed framed attempt returns the remaining startup probes to ordinary I²C reads.
+- Matching IOGraphics profiles for Ventura, Sonoma, and Sequoia, enabled with `-dbcompat`.
+- Experimental endpoint recovery after eligible display-mode changes, with optional HDR recovery tracing, delay, and probe-window controls.
+- `-dbbootlog` startup checkpoints and the manual `ExportBootLog.command` TXT exporter, including framebuffer topology and DDC probe results.
 
-下载并解压 ZIP，将 `DisplayBrightness.kext` 放入 `EFI/OC/Kexts`，在 OpenCore `Kernel -> Add` 中启用并放在 Lilu 之后，保存并重启。操作前请备份自己的 EFI。完整安装、使用及回退步骤见 [README.md](https://github.com/Xiaoheixu/DisplayBrightness/blob/main/README.md)。
+### Fixed
 
-遇到问题请提交 [Issue](https://github.com/Xiaoheixu/DisplayBrightness/issues)。
+- Failed DDC requests now stop at a bounded retry limit. New brightness input can start another attempt.
+- Displays waiting for the shared DDC bus yield their workers and retain the latest request. Pending probes can resume when a slot becomes available.
+- Startup probes that have expired skip hardware I/O. A brightness write also rechecks the verified reply mode so it can be read back.
+- DisplayBrightness preserves an existing native brightness provider and retires its own endpoint when the system takes over.
 
-## English
+### Downloads and boot arguments
 
-First test prerelease. Provides native macOS brightness controls for external monitors through DDC/CI. Enabled automatically; use `-dboff` to disable.
+- **RELEASE ZIP** for general use. **DEBUG ZIP** includes additional startup logging and a matching `.dSYM`. Both include the TXT exporter. Use the SHA-256 file to verify your download.
+- Install one `DisplayBrightness.kext` after Lilu in OpenCore. Requires x86_64, Lilu 1.7.3+, a matching IOGraphics profile, and a working DDC/CI path.
+- Use `-dbcompat` for matching older macOS profiles, `-dbbootlog` for startup diagnostics, and `-dboff` to disable the plugin. `-dbhdr` opts into experimental mode-change recovery. Hardware control in HDR depends on the monitor accepting DDC/CI in that mode.
 
-x86_64 only; requires Lilu 1.7.3+. Currently limited to Darwin 25.6 and a specific IOGraphics UUID. The monitor and connection path must provide working DDC/CI communication. Other hardware, sleep/wake, hot-plug and multiple monitors are not guaranteed to work.
-
-Extract the ZIP, copy `DisplayBrightness.kext` to `EFI/OC/Kexts`, enable it in OpenCore `Kernel -> Add` after Lilu, save and reboot. Back up your own EFI first. See [README.md](https://github.com/Xiaoheixu/DisplayBrightness/blob/main/README.md) for complete installation, usage and rollback instructions.
-
-Please report problems through [Issues](https://github.com/Xiaoheixu/DisplayBrightness/issues).
+See the [README](https://github.com/Xiaoheixu/DisplayBrightness/blob/0.0.4/README.md) for the complete boot argument reference, installation steps, and what to include in a report.

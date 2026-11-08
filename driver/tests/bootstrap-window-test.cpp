@@ -12,5 +12,9 @@ int main(){
  p=BootstrapWindow{};assert(p.begin(100));assert(p.maySchedule(58000000100ULL));assert(!p.maySchedule(59000000100ULL));
  assert(!p.begin(50));
  p=BootstrapWindow{};assert(p.begin(0));assert(p.within(59000000000ULL));assert(!p.within(60000000000ULL));
+ p=BootstrapWindow{};p.configure(5,2000);
+ assert(p.begin(0) && p.maySchedule(2999999999ULL));
+ assert(!p.maySchedule(3000000000ULL) && p.within(4999999999ULL));
+ assert(!p.begin(5000000000ULL));
  puts("startup window: one-second cadence, 60-round cap, elapsed deadline, zero origin and backward-clock rejection pass");
 }

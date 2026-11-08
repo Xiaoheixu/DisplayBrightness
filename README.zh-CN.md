@@ -22,7 +22,7 @@ DisplayBrightness
 
 #### 配置
 
-- 正常运行无需本插件专用启动参数。
+- 匹配的 Tahoe 图像无需本插件专用启动参数。Ventura、Sonoma 和 Sequoia 的匹配图像需添加 `-dbcompat`。
 - 添加 `-dboff` 可禁用本插件，修改后重启生效。
 - 如果显示器菜单提供 DDC/CI 开关，请将其启用。
 
@@ -30,7 +30,7 @@ DisplayBrightness
 
 #### 注意事项
 
-- 仅支持 x86_64，目前受 **Darwin 25.6 及指定 IOGraphics UUID** 的 ABI 兼容性条件限制。
+- 仅支持 x86_64，运行时检查 Darwin 主次版本及 IOGraphics UUID。参考构建和完整启动参数见 [英文 README](README.md#boot-arguments)。
 - 需要可用的 **IOFramebuffer I2C** 通信路径。显示器支持 DDC/CI 不代表显卡驱动、线缆或转接设备一定兼容。
 - 其他硬件、睡眠唤醒、热插拔及多屏配置仍待验证。
 - 系统滑块显示归一化百分比，数值为 0 不代表物理背光一定关闭。

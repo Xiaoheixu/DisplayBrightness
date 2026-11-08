@@ -8,6 +8,8 @@
 !/driver/
 /driver/*
 !/driver/Info.plist
+!/driver/build.sh
+!/driver/ExportBootLog.command
 !/driver/src/
 !/driver/tests/
 .DS_Store

@@ -12,6 +12,12 @@
 #include "ResponsiveRead.hpp"
 #include "VerifyTarget.hpp"
 #include "RetirePolicy.hpp"
+#include "BusAdmission.hpp"
+#include "ProviderPolicy.hpp"
+#include "BootSettings.hpp"
+#include "BootLog.hpp"
+#include "ReplyMode.hpp"
+#include "EndpointRefresh.hpp"
 #include "ReadRecovery.hpp"
 #include "StateSync.hpp"
 #include "Bootstrap.hpp"
@@ -24,6 +30,22 @@
 #include <kern/clock.h>
 #include "RequestPolicy.hpp"
 #include <libkern/c++/OSBoolean.h>
+// x86_64 layouts from the 23J631 and 24H232 IOGraphics dSYMs.
+static_assert(sizeof(IOI2CRequest) == 124 && alignof(IOI2CRequest) == 4,
+              "Unexpected IOI2CRequest layout");
+static_assert(offsetof(IOI2CRequest, sendTransactionType) == 0 &&
+              offsetof(IOI2CRequest, replyTransactionType) == 4 &&
+              offsetof(IOI2CRequest, sendAddress) == 8 &&
+              offsetof(IOI2CRequest, replyAddress) == 12 &&
+              offsetof(IOI2CRequest, replySubAddress) == 17 &&
+              offsetof(IOI2CRequest, minReplyDelay) == 20 &&
+              offsetof(IOI2CRequest, result) == 28 &&
+              offsetof(IOI2CRequest, sendBytes) == 40 &&
+              offsetof(IOI2CRequest, replyBytes) == 56 &&
+              offsetof(IOI2CRequest, completion) == 60 &&
+              offsetof(IOI2CRequest, sendBuffer) == 68 &&
+              offsetof(IOI2CRequest, replyBuffer) == 76,
+              "Unexpected IOI2CRequest member offsets");
 namespace {
 using Update=bool (*)(IOService *);
 using SetProperties=IOReturn (*)(IOService *,OSObject *);
@@ -35,14 +57,15 @@ Update originalUpdate=nullptr;
 IntegerSet originalInteger=nullptr;
 FrameGate frameLock=nullptr,frameUnlock=nullptr;
 bool routesReady=false,uiRequested=false,edmRequested=false;
+bool modeRefreshRequested=false; // Immutable after begin; experimental opt-in.
+bool legacyCompatibilityRequested=false;
+dbboot::Settings bootSettings;
 using StartIO=IOReturn (*)(IOService *,IOI2CRequest *);
 StartIO startIO=nullptr;
-IOLock *probeSerial=nullptr;
 const char *ownerKey="DisplayBrightnessProbeRange";
 const char *simKey="DisplayBrightnessProbeSimulated";
 const char *paths[]={"/System/Library/Extensions/IOGraphicsFamily.kext/IOGraphicsFamily"};
 KernelPatcher::KextInfo graphics={"com.apple.iokit.IOGraphicsFamily",paths,1,{true},{},0};
-const UInt8 uuid[]={0x74,0xaa,0x64,0x83,0x8a,0xb4,0x3a,0x94,0x81,0x43,0x5e,0x30,0x6c,0x16,0xd7,0xda};
 bool enabled(){return __atomic_load_n(&routesReady,__ATOMIC_ACQUIRE) && uiRequested;}
 bool hasClass(IORegistryEntry *s,const char *name){
  if(!s)return false;
@@ -58,6 +81,8 @@ bool pilot(IOService *s){
  if(p)p->release();return ok;
 }
 void routeState(const char *state){
+ if(dbBootLogEnabled)
+  IOLog("DisplayBrightness DBBOOT version=%s stage=%s\n",xStringify(MODULE_VERSION),state);
  auto *root=IOService::getServiceRoot();
  if(root){root->setProperty("DisplayBrightnessRequestProbeRouting",state);root->setProperty("DisplayBrightnessRequestProbeVersion",xStringify(MODULE_VERSION));}
 }
@@ -154,7 +179,7 @@ void publish(IOService *s,bool haveSeed,UInt32 seed){
  if(ok)ok=s->setProperty("IODisplayParameters",params);
  if(!ok){s->removeProperty(ownerKey);s->removeProperty(simKey);}
  if(range)range->release();if(params)params->release();old->release();if(owned)owned->release();
- IOLog("DisplayBrightness: UI probe display=%llu published=%d hardware-seeded endpoint\n",s->getRegistryEntryID(),ok);
+ if(bootSettings.trace)IOLog("DisplayBrightness: UI probe display=%llu published=%d hardware-seeded endpoint\n",s->getRegistryEntryID(),ok);
 }
 void publishEDMMarker(IOService *s){
  // Experimental driver-protocol marker, not a changed EDID or hardware identity.
@@ -199,13 +224,14 @@ bool update(IOService *s){
  bool ok=originalUpdate(s);
  if(pilot(s)){
   s->setProperty("DisplayBrightnessRequestProbeRouteReady",__atomic_load_n(&routesReady,__ATOMIC_ACQUIRE));
-  IOLog("DisplayBrightness: update display=%llu original=%d\n",s->getRegistryEntryID(),ok);
-  if(ok && enabled()){
+  if(bootSettings.trace)IOLog("DisplayBrightness: update display=%llu original=%d\n",s->getRegistryEntryID(),ok);
+  if(ok && enabled() && hardwareRequested){
    FrameScope frame(s);
    if(frame.valid(s)){
-    if(hardwareRequested){
-     if(hardwarePilot(s)){publish(s,false,0);publishEDMMarker(s);queueHardware(s,frame.frameService,0,true);}
+    if(dbboot::publishesBrightness(hardwareRequested,bootSettings.getOnly)){
+     publish(s,false,0);publishEDMMarker(s);
     }
+    queueHardware(s,frame.frameService,0,true);
    }
   }
  }
@@ -230,7 +256,7 @@ bool integer(IOService *s,OSDictionary *p,const OSSymbol *key,UInt32 value){
   record(s,"DisplayBrightnessIntegerExit",seq,"forwarded-native",key,true,value,ok);return ok;
  }
  bool accepted=false;bool queued=false;
- if(enabled() && pilot(s)){
+ if(enabled() && dbboot::publishesBrightness(hardwareRequested,bootSettings.getOnly) && pilot(s)){
   FrameScope frame(s);
   if(frame.valid(s)){
    OSObject *owned=s->copyProperty(ownerKey);
@@ -238,19 +264,21 @@ bool integer(IOService *s,OSDictionary *p,const OSSymbol *key,UInt32 value){
    auto *params=OSDynamicCast(OSDictionary,property);
    bool ours=owned && params && params->getObject("brightness")==owned && (p==owned || p==params);
    accepted=dbRequestAction(true,ours,true,value<=100)==DBRequestAction::Simulate;
-   if(accepted && hardwareRequested){queued=queueHardware(s,frame.frameService,value);accepted=queued;}
+   if(accepted){queued=queueHardware(s,frame.frameService,value);accepted=queued;}
    if(property)property->release();if(owned)owned->release();
   }
  }
- IOLog("DisplayBrightness: UI request display=%llu value=%u accepted=%d hardwareQueued=%d\n",s?s->getRegistryEntryID():0ULL,value,accepted,queued);
- record(s,"DisplayBrightnessIntegerExit",seq,queued?"hardware-queued":(accepted?"simulated-accepted":"rejected"),key,true,value,accepted);
+ if(bootSettings.trace)IOLog("DisplayBrightness: UI request display=%llu value=%u accepted=%d hardwareQueued=%d\n",s?s->getRegistryEntryID():0ULL,value,accepted,queued);
+ record(s,"DisplayBrightnessIntegerExit",seq,queued?"hardware-queued":"rejected",key,true,value,accepted);
  return accepted; // Known synthetic requests NEVER enter native handlers.
 }
 
 void loaded(void *,KernelPatcher &patcher,size_t id,mach_vm_address_t address,size_t size){
  if(id!=graphics.loadIndex)return;
  routeState("callback-entered");
- if(getKernelVersion()!=KernelVersion::Tahoe || getKernelMinorVersion()!=6 || !dbImageUUIDMatches(reinterpret_cast<const void *>(address),size,uuid)){
+ const auto *profile=dbMatchGraphicsProfile(static_cast<unsigned>(getKernelVersion()),
+  getKernelMinorVersion(),legacyCompatibilityRequested,reinterpret_cast<const void *>(address),size);
+ if(!profile){
   routeState("image-kernel-rejected");
   IOLog("DisplayBrightness: image/kernel gate rejected\n");return;
  }
@@ -260,6 +288,9 @@ void loaded(void *,KernelPatcher &patcher,size_t id,mach_vm_address_t address,si
   startIO=reinterpret_cast<StartIO>(patcher.solveSymbol(id,"__ZN25IOFramebufferI2CInterface7startIOEP12IOI2CRequest",address,size));
   if(!startIO){IOLog("DisplayBrightness: DDC read probe symbol unavailable\n");patcher.clearError();}
  }
+ if(dbBootLogEnabled)
+  IOLog("DisplayBrightness DBBOOT stage=symbol-resolution profile=%s framebufferGate=%d ddcRequested=%d ddcResolved=%d\n",
+        profile->referenceBuild,frameLock && frameUnlock,hardwareRequested,startIO!=nullptr);
  if(!frameLock || !frameUnlock){
   routeState("framebuffer-gate-unavailable");
   IOLog("DisplayBrightness: framebuffer gate resolution failed; no routes\n");patcher.clearError();return;
@@ -274,6 +305,8 @@ void loaded(void *,KernelPatcher &patcher,size_t id,mach_vm_address_t address,si
   IOLog("DisplayBrightness: routing incomplete error=%u; no publication\n",static_cast<unsigned>(patcher.getError()));patcher.clearError();return;
  }
  __atomic_store_n(&routesReady,true,__ATOMIC_RELEASE);
+ auto *root=IOService::getServiceRoot();
+ if(root)root->setProperty("DisplayBrightnessGraphicsProfile",profile->referenceBuild);
  routeState("ready");
  IOLog("DisplayBrightness: routes ready uiProbe=%d hardware=%d\n",uiRequested,hardwareRequested);
 }
@@ -283,24 +316,65 @@ void hardwareInitFailed(const char *reason){
  if(retireCall){thread_call_free(retireCall);retireCall=nullptr;}
  if(admissionCall){thread_call_free(admissionCall);admissionCall=nullptr;}
  if(hardwareQueue){IOLockFree(hardwareQueue);hardwareQueue=nullptr;}
- if(probeSerial){IOLockFree(probeSerial);probeSerial=nullptr;}
  routeState(reason);
 }
 void begin(){
  routeState("bootstrap-entered");
- // Automatic capability probing is the only normal mode; -dboff is handled by Lilu.
- uiRequested=true;edmRequested=true;hardwareRequested=true;
- auto *root=IOService::getServiceRoot();if(root)root->setProperty("DisplayBrightnessStartupMode","automatic-brightness");
- hardwareQueue=IOLockAlloc();if(!hardwareQueue){hardwareInitFailed("hardware-queue-unavailable");return;}
- retireCall=thread_call_allocate_with_priority(retireWorker,nullptr,THREAD_CALL_PRIORITY_LOW);
- admissionCall=thread_call_allocate_with_priority(admissionWorker,nullptr,THREAD_CALL_PRIORITY_LOW);
- if(!retireCall||!admissionCall){hardwareInitFailed("bootstrap-workers-unavailable");return;}
- probeSerial=IOLockAlloc();if(!probeSerial){hardwareInitFailed("hardware-serial-unavailable");return;}
+ legacyCompatibilityRequested=checkKernelArgument("-dbcompat");
+ const auto kernel=getKernelVersion();
+ if((kernel==KernelVersion::Ventura || kernel==KernelVersion::Sonoma || kernel==KernelVersion::Sequoia) && !legacyCompatibilityRequested){
+  routeState("legacy-opt-in-required");
+  return;
+ }
+ // Keep routing in the diagnostic mode so DDC can be isolated from the hooks.
+ hardwareRequested=!checkKernelArgument("-dbnoddc");
+ bootSettings.getOnly=hardwareRequested && checkKernelArgument("-dbgetonly");
+ bootSettings.trace=checkKernelArgument("-dbtrace");
+ bootSettings.notify=!checkKernelArgument("-dbnonotify");
+ for(const auto &option:dbboot::numericOptions){
+  uint64_t value=UINT64_MAX;
+  if(lilu_get_boot_args(option.name,&value,sizeof(value)))
+   dbboot::applyNumeric(bootSettings,option,value);
+ }
+ uiRequested=true;
+ bool publishEnabled=dbboot::publishesBrightness(hardwareRequested,bootSettings.getOnly);
+ edmRequested=publishEnabled && !checkKernelArgument("-dbnoedm");
+ modeRefreshRequested=publishEnabled && checkKernelArgument("-dbhdr");
+ bootSettings.hdrTrace=modeRefreshRequested && checkKernelArgument("-dbhdrtrace");
+ auto *root=IOService::getServiceRoot();if(root){
+  const char *mode=!hardwareRequested?"hooks-only-no-ddc":(bootSettings.getOnly?"get-only":"automatic-brightness");
+  root->setProperty("DisplayBrightnessStartupMode",mode);
+  root->setProperty("DisplayBrightnessDDCEnabled",hardwareRequested?kOSBooleanTrue:kOSBooleanFalse);
+  root->setProperty("DisplayBrightnessHDRRecoveryEnabled",modeRefreshRequested?kOSBooleanTrue:kOSBooleanFalse);
+  auto *tuning=OSDictionary::withCapacity(13);
+  if(tuning){
+   for(const auto &option:dbboot::numericOptions)number(tuning,option.name,bootSettings.*(option.member));
+   tuning->setObject("hdrTrace",bootSettings.hdrTrace?kOSBooleanTrue:kOSBooleanFalse);
+   tuning->setObject("trace",bootSettings.trace?kOSBooleanTrue:kOSBooleanFalse);
+   tuning->setObject("notify",publishEnabled && bootSettings.notify?kOSBooleanTrue:kOSBooleanFalse);
+   tuning->setObject("edm",edmRequested?kOSBooleanTrue:kOSBooleanFalse);
+   root->setProperty("DisplayBrightnessTuning",tuning);
+   tuning->release();
+  }
+ }
+ if(hardwareRequested){
+  hardwareQueue=IOLockAlloc();if(!hardwareQueue){hardwareInitFailed("hardware-queue-unavailable");return;}
+  retireCall=thread_call_allocate_with_priority(retireWorker,nullptr,THREAD_CALL_PRIORITY_LOW);
+  admissionCall=thread_call_allocate_with_priority(admissionWorker,nullptr,THREAD_CALL_PRIORITY_LOW);
+  if(!retireCall||!admissionCall){hardwareInitFailed("bootstrap-workers-unavailable");return;}
+ }
  routeState("registering-callback");
  auto e=lilu.onKextLoad(&graphics,1,loaded);
  if(e!=LiluAPI::Error::NoError)routeState("callback-registration-failed");
  IOLog("DisplayBrightness: callback registration=%u uiProbe=%d\n",static_cast<unsigned>(e),uiRequested);
 }
 const char *disableArgs[]={"-dboff"};
+#ifdef DEBUG
+const char *debugArgs[]={"-dbbootlog"};
+constexpr size_t debugArgCount=1;
+#else
+const char **debugArgs=nullptr;
+constexpr size_t debugArgCount=0;
+#endif
 }
-PluginConfiguration ADDPR(config)={xStringify(PRODUCT_NAME),parseModuleVersion(xStringify(MODULE_VERSION)),LiluAPI::AllowNormal,disableArgs,1,nullptr,0,nullptr,0,KernelVersion::Tahoe,KernelVersion::Tahoe,begin};
+PluginConfiguration ADDPR(config)={xStringify(PRODUCT_NAME),parseModuleVersion(xStringify(MODULE_VERSION)),LiluAPI::AllowNormal,disableArgs,1,debugArgs,debugArgCount,nullptr,0,KernelVersion::Ventura,KernelVersion::Tahoe,begin};

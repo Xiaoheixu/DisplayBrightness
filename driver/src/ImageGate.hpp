@@ -23,3 +23,29 @@ inline bool dbImageUUIDMatches(const void *image,size_t length,const unsigned ch
     }
     return matched && cursor==end;
 }
+
+// Each image is tied to the kernel ABI against which it was examined.
+struct DBGraphicsProfile {
+    unsigned major;
+    unsigned minor;
+    bool experimental;
+    unsigned char uuid[16];
+    const char *referenceBuild;
+};
+constexpr DBGraphicsProfile dbGraphicsProfiles[] = {
+    {25, 6, false, {0x74,0xaa,0x64,0x83,0x8a,0xb4,0x3a,0x94,0x81,0x43,0x5e,0x30,0x6c,0x16,0xd7,0xda}, "25G332"},
+    {24, 6, true, {0xca,0x8b,0x49,0xbc,0x36,0x55,0x31,0x2c,0x91,0xaa,0xfb,0x84,0x82,0x51,0xc7,0x8e}, "24H232"},
+    {23, 6, true, {0x79,0xf2,0xf7,0xe4,0xe4,0x51,0x35,0xe1,0xbf,0x22,0x1e,0xff,0xa4,0x19,0x28,0x88}, "23J631"},
+    {22, 6, true, {0x71,0x8e,0x01,0xcf,0x8b,0x05,0x30,0x42,0x88,0xf4,0xde,0x34,0x41,0x39,0x5d,0x00}, "22H625"},
+};
+inline const DBGraphicsProfile *dbMatchGraphicsProfile(unsigned major, unsigned minor,
+    bool legacyAllowed, const void *image, size_t length) {
+    for (const auto &profile : dbGraphicsProfiles) {
+        if (profile.major == major && profile.minor == minor &&
+            (!profile.experimental || legacyAllowed) &&
+            dbImageUUIDMatches(image, length, profile.uuid)) {
+            return &profile;
+        }
+    }
+    return nullptr;
+}

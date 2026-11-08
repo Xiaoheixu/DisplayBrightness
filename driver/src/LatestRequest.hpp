@@ -3,10 +3,14 @@
 namespace dbhw {
 struct LatestRequest {
  bool busy=false,pending=false,failed=false,stopped=false;
+ static constexpr unsigned maxAutomaticFailureRetries=2;
  unsigned desired=0;
+ unsigned automaticFailureRetries=0;
  bool submit(unsigned value,bool &schedule){
   schedule=false;if(stopped || value>100)return false;
-  desired=value;pending=true;if(!busy){busy=true;schedule=true;}return true;
+  desired=value;pending=true;
+  if(!busy){automaticFailureRetries=0;busy=true;schedule=true;}
+  return true;
  }
  bool refreshAfterRead(uint64_t latest,unsigned &target,uint64_t &sequence){
   if(stopped || !busy)return false;
@@ -14,9 +18,14 @@ struct LatestRequest {
   return true;
  }
  unsigned take(){pending=false;return desired;}
- bool complete(bool success){
+ bool complete(bool success,bool boundFailureRetries=false,unsigned retryLimit=maxAutomaticFailureRetries){
   failed=!success;
-  if(!success)pending=true; // recover automatically, keep latest desired
+  if(success)automaticFailureRetries=0;
+  else if(!boundFailureRetries || automaticFailureRetries<retryLimit){
+   if(boundFailureRetries)++automaticFailureRetries;
+   pending=true;
+  }
+  // At the limit, preserve a newer input but stop requeuing an old target.
   if(pending && !stopped)return true;
   busy=false;return false;
  }

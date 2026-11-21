@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "BootstrapWindow.hpp"
 namespace dbhw {
 // Caller serializes admission, release and wakeups with the endpoint queue.
 template<unsigned Slots> struct BusAdmission {
@@ -31,4 +32,13 @@ template<unsigned Slots> struct BusAdmission {
         return ready;
     }
 };
+enum class VisitAdmission { Parked, Ready, Exhausted };
+// Queue held. A parked first visit must not start the probe deadline.
+// Both Ready and Exhausted own the bus token; the caller must release it.
+template<unsigned Slots> VisitAdmission admitVisit(BusAdmission<Slots> &bus,
+ unsigned slot,dbstate::BootstrapWindow &window,bool initialized,uint64_t now){
+ if(!bus.acquire(slot))return VisitAdmission::Parked;
+ return initialized || window.begin(now) ? VisitAdmission::Ready : VisitAdmission::Exhausted;
+}
+
 }

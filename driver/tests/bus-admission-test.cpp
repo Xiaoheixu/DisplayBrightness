@@ -17,9 +17,17 @@ int main() {
     assert(!bus.acquire(2) && !bus.parked(2));
     assert(!bus.acquire(8) && bus.release(8) == 0);
     assert(bus.release(2) == 0 && bus.acquire(1));
-    dbstate::BootstrapWindow startup;
-    startup.observe(0); // first callback was parked without consuming a read
-    assert(startup.rounds == 0);
-    assert(!startup.begin(dbstate::BootstrapWindow::durationNs));
+    dbhw::BusAdmission<2> waitingBus;dbstate::BootstrapWindow startup;
+    assert(waitingBus.acquire(0));
+    assert(dbhw::admitVisit(waitingBus,1,startup,false,0)==dbhw::VisitAdmission::Parked);
+    assert(!startup.begun&&startup.rounds==0);
+    assert(waitingBus.release(0)==2);
+    assert(dbhw::admitVisit(waitingBus,1,startup,false,60000000000ULL)==dbhw::VisitAdmission::Ready);
+    assert(startup.rounds==1&&startup.firstNs==60000000000ULL);
+    waitingBus.release(1);
+    assert(dbhw::admitVisit(waitingBus,1,startup,false,120000000000ULL)==dbhw::VisitAdmission::Exhausted);
+    waitingBus.release(1);
+    // Initialized brightness work is independent of startup budget exhaustion.
+    assert(dbhw::admitVisit(waitingBus,1,startup,true,120000000000ULL)==dbhw::VisitAdmission::Ready);
     puts("bus admission: parked slots, retirement, owner release, and startup deadline passed");
 }

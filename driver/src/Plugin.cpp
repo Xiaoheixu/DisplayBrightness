@@ -8,6 +8,7 @@
 #include "DDCProtocol.hpp"
 #include "HardwarePolicy.hpp"
 #include "LatestRequest.hpp"
+#include "DisplayUpdateGuard.hpp"
 #include <libkern/c++/OSArray.h>
 #include "ResponsiveRead.hpp"
 #include "VerifyTarget.hpp"
@@ -145,14 +146,14 @@ struct FrameScope {
   if(frame)frame->release();if(connection)connection->release();
  }
 };
-void publish(IOService *,bool,UInt32);
+void publish(IOService *,UInt32);
 void publishEDMMarker(IOService *);
 #include "HardwareWorker.inc"
 bool number(OSDictionary *d,const char *key,UInt32 value){
  OSNumber *n=OSNumber::withNumber(value,32);if(!n)return false;
  bool ok=d->setObject(key,n);n->release();return ok;
 }
-void publish(IOService *s,bool haveSeed,UInt32 seed){
+void publish(IOService *s,UInt32 seed){
  // Caller holds this display's existing framebuffer gate, never a new global lock.
  OSObject *property=s->copyProperty("IODisplayParameters");
  OSDictionary *old=OSDynamicCast(OSDictionary,property);
@@ -164,16 +165,10 @@ void publish(IOService *s,bool haveSeed,UInt32 seed){
   if(current!=owned){s->removeProperty(ownerKey);s->removeProperty(simKey);}
   old->release();if(owned)owned->release();return;
  }
- UInt32 value=seed;
- if(!owned && !haveSeed){old->release();return;}
- if(auto *range=OSDynamicCast(OSDictionary,owned)){
-  if(auto *n=OSDynamicCast(OSNumber,range->getObject("value")))
-   if(n->unsigned32BitValue()<=100)value=n->unsigned32BitValue();
- }
  OSDictionary *params=OSDictionary::withDictionary(old);
  OSDictionary *range=OSDictionary::withCapacity(3);
  bool ok=params && range && number(range,"min",0) && number(range,"max",100) &&
-  number(range,"value",value) && range->setObject("DisplayBrightnessSynthetic",kOSBooleanTrue) && params->setObject("brightness",range);
+  number(range,"value",seed) && range->setObject("DisplayBrightnessSynthetic",kOSBooleanTrue) && params->setObject("brightness",range);
  if(ok)ok=s->setProperty(ownerKey,range);
  if(ok)ok=s->setProperty(simKey,true);
  if(ok)ok=s->setProperty("IODisplayParameters",params);
@@ -221,7 +216,8 @@ void publishEDMMarker(IOService *s){
  s->setProperty("DisplayBrightnessEDMProbeState",ok?"marker-published-synthetic":"publication-failed");
 }
 bool update(IOService *s){
- bool ok=originalUpdate(s);
+ bool ok=false;
+ {DisplayUpdateScope pause(s);ok=originalUpdate(s);}
  if(pilot(s)){
   s->setProperty("DisplayBrightnessRequestProbeRouteReady",__atomic_load_n(&routesReady,__ATOMIC_ACQUIRE));
   if(bootSettings.trace)IOLog("DisplayBrightness: update display=%llu original=%d\n",s->getRegistryEntryID(),ok);
@@ -229,7 +225,10 @@ bool update(IOService *s){
    FrameScope frame(s);
    if(frame.valid(s)){
     if(dbboot::publishesBrightness(hardwareRequested,bootSettings.getOnly)){
-     publish(s,false,0);publishEDMMarker(s);
+     if(brightnessProvider(s)==dbhw::BrightnessProvider::Foreign){
+      s->removeProperty(ownerKey);s->removeProperty(simKey);
+     }
+     publishEDMMarker(s);
     }
     queueHardware(s,frame.frameService,0,true);
    }
@@ -277,7 +276,7 @@ void loaded(void *,KernelPatcher &patcher,size_t id,mach_vm_address_t address,si
  if(id!=graphics.loadIndex)return;
  routeState("callback-entered");
  const auto *profile=dbMatchGraphicsProfile(static_cast<unsigned>(getKernelVersion()),
-  getKernelMinorVersion(),legacyCompatibilityRequested,reinterpret_cast<const void *>(address),size);
+  static_cast<unsigned>(getKernelMinorVersion()),legacyCompatibilityRequested,reinterpret_cast<const void *>(address),size);
  if(!profile){
   routeState("image-kernel-rejected");
   IOLog("DisplayBrightness: image/kernel gate rejected\n");return;

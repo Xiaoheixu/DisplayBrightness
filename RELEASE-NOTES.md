@@ -1,3 +1,19 @@
+# DisplayBrightness 0.0.45
+
+## Fixed
+
+- Deferred DDC work during display updates and for two seconds afterward. Interrupted requests retain the latest brightness target and resume with a fresh hardware read.
+- Improved startup recovery by alternating supported reply modes within the bounded probe window and re-probing when a failed endpoint receives a different usable I2C interface.
+- Started the initial probe budget after bus admission so time spent waiting for another display does not exhaust the first probe.
+- Preserved pending display probes when disconnected endpoints temporarily occupy all slots, and resumed admission automatically after their callbacks finish and cleanup completes.
+- Improved brightness response during failure recovery: a different target brings a pending retry forward; repeated requests for the same target keep the bounded retry budget.
+- Expanded the boot report with bounded raw reply history, brightness request and target values, verification results, endpoint snapshots, and DDC deferral state.
+
+## Validation
+
+- 28 C++ tests and diagnostic-export checks passed.
+- Release build and archive integrity checks passed.
+
 ## DisplayBrightness 0.0.4
 
 This prerelease adds external-monitor DDC/CI compatibility improvements, additional macOS profiles, and startup diagnostics. Compatible monitors use the native macOS brightness controls to adjust hardware brightness.

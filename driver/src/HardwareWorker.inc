@@ -12,6 +12,9 @@ struct HardwareSlot {
  bool superseded=false,recoveryProbe=false,recoveryReadmit=false;
  bool haveOriginal=false,retiring=false,reclaiming=false,terminal=false,initialized=false;
  dbhw::LatestRequest requests;
+ dbhw::DisplayUpdateGuard updateGuard;
+ UInt64 cycleGeneration=0,deferredCycles=0;
+ bool deferred=false;
  UInt64 sequence=0,busWaitSinceNs=0;UInt16 verifiedCurrent=0,verifiedMaximum=0;
  bool haveNotified=false;UInt32 lastNotifiedPercent=0;
 };
@@ -25,6 +28,60 @@ PendingBootstrap pendingBootstrap;
 bool queueHardware(IOService *,IOService *,UInt32,bool);
 void releaseBootstrapTicket(PendingBootstrap::Ticket ticket){
  if(ticket.display){ticket.frame->release();ticket.display->release();}
+}
+UInt64 hardwareNowNs(){UInt64 now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);return ns;}
+// hardwareQueue held. These describe guard state, not whether startIO is active.
+void guardState(HardwareSlot *c,UInt64 now){
+ c->display->setProperty("DisplayBrightnessDDCGuardState",c->updateGuard.depth?"display-update":(c->updateGuard.ready(now)?"ready":"settling"));
+ c->display->setProperty("DisplayBrightnessDDCGuardGeneration",c->updateGuard.generation,64);
+ c->display->setProperty("DisplayBrightnessDDCGuardUntilUptimeNs",c->updateGuard.untilNs,64);
+ c->display->setProperty("DisplayBrightnessDDCDeferredCycles",c->deferredCycles,64);
+}
+// Stack-owned records also cover an endpoint first admitted by a nested update.
+// No sleep, bus access, cancellation wait or endpoint allocation in this scope.
+struct DisplayUpdateScope;
+DisplayUpdateScope *displayUpdates=nullptr;
+struct DisplayUpdateScope {
+ IOService *display=nullptr;DisplayUpdateScope *next=nullptr;
+ explicit DisplayUpdateScope(IOService *s){
+  if(!hardwareRequested || !hardwareQueue || !enabled() || !pilot(s))return;
+  FrameScope gate(s);if(!gate.valid(s))return;
+  IOLockLock(hardwareQueue);
+  display=s;next=displayUpdates;displayUpdates=this;
+  for(auto &c:hardwareSlots)if(c.display==s&&!c.retiring){
+   c.updateGuard.begin();guardState(&c,hardwareNowNs());break;
+  }
+  IOLockUnlock(hardwareQueue);
+ }
+ ~DisplayUpdateScope(){
+  if(!display)return;
+  // Balance even if originalUpdate changed identity, topology or active state.
+  IOLockLock(hardwareQueue);
+  auto **link=&displayUpdates;while(*link&&*link!=this)link=&(*link)->next;
+  if(*link)*link=next;
+  for(auto &c:hardwareSlots)if(c.display==display&&!c.retiring){
+   c.updateGuard.end(hardwareNowNs());guardState(&c,hardwareNowNs());break;
+  }
+  IOLockUnlock(hardwareQueue);
+ }
+};
+// hardwareQueue held. Preserve latest target and busy ownership until resumed.
+void deferHardware(HardwareSlot *c,bool bootstrapCompleted=false){
+ ++c->deferredCycles;
+ if(!c->requests.defer(bootstrapCompleted)){guardState(c,hardwareNowNs());return;}
+ UInt64 now=hardwareNowNs(),remaining=c->updateGuard.untilNs>now?c->updateGuard.untilNs-now:0;
+ UInt64 ms=c->updateGuard.depth?100:(remaining/1000000ULL+(remaining%1000000ULL!=0));
+ if(!ms)ms=1;
+ uint64_t deadline;clock_interval_to_deadline(static_cast<UInt32>(ms),kMillisecondScale,&deadline);
+ guardState(c,now);thread_call_enter_delayed(c->call,deadline);
+}
+// Transport/publication callers hold the native gate. Retry polling only reads
+// guard state under the queue; it never authorizes transport by itself.
+bool cyclePermitted(HardwareSlot *c){
+ IOLockLock(hardwareQueue);
+ bool ok=c->updateGuard.permits(hardwareNowNs(),c->cycleGeneration);
+ if(!ok)c->deferred=true;
+ IOLockUnlock(hardwareQueue);return ok;
 }
 void admissionWorker(thread_call_param_t,thread_call_param_t){
  for(unsigned i=0;i<dbcompat::endpointCapacity;i++){
@@ -75,6 +132,7 @@ void retireWorker(thread_call_param_t,thread_call_param_t){
   c.display=nullptr;c.frame=nullptr;c.interface=nullptr;
   c.bootstrapWindow=dbstate::BootstrapWindow{};c.replyMode=dbhw::ReplyMode{};
   c.bootAttempt=dbstate::BootstrapAttempt{};c.bootJournal=dbstate::BootstrapJournal{};
+  c.updateGuard=dbhw::DisplayUpdateGuard{};c.cycleGeneration=0;c.deferredCycles=0;c.deferred=false;
   c.requests=dbhw::LatestRequest{};c.haveOriginal=false;c.terminal=false;c.initialized=false;
   c.sequence=0;c.busWaitSinceNs=0;c.verifiedCurrent=0;c.verifiedMaximum=0;
   c.haveNotified=false;c.lastNotifiedPercent=0;c.superseded=false;
@@ -118,8 +176,38 @@ bool captureEndpointEDID(IOService *s,UInt8 (&bound)[128]){
  if(ok)memcpy(bound,e->getBytesNoCopy(),128);
  if(o)o->release();return ok;
 }
-bool hardwareLive(HardwareSlot *c,FrameScope &gate,bool bootstrapRead=false){
- if(!c->interface || !gate.valid(c->display))return false;
+// Scan only the bound framebuffer's direct IOService children. The caller
+// holds its native gate; an inactive service can still be present during teardown.
+IOService *copyUniqueActiveInterface(IOService *frame,unsigned &count,bool *enumerated=nullptr){
+ dbhw::ActiveInterfaces<IOService> interfaces;
+ auto *it=frame->getChildIterator(gIOServicePlane);
+ if(enumerated)*enumerated=it!=nullptr;
+ if(it){
+  while(auto *child=it->getNextObject()){
+   auto *service=OSDynamicCast(IOService,child);
+   if(service && hasClass(service,"IOFramebufferI2CInterface"))
+    interfaces.observe(service,service->isInactive());
+  }
+ }
+ count=interfaces.count;
+ auto *selected=interfaces.unique();
+ if(selected)selected->retain();
+ if(it)it->release();
+ return selected;
+}
+OSNumber *copyTransactionTypes(IOService *interface){
+ auto *property=interface?interface->copyProperty(kIOI2CTransactionTypesKey):nullptr;
+ auto *types=OSDynamicCast(OSNumber,property);
+ if(property && !types)property->release();
+ return types;
+}
+bool supportsSimple(OSNumber *types){
+ return types && (types->unsigned32BitValue()&(1U<<kIOI2CSimpleTransactionType));
+}
+bool hardwareLive(HardwareSlot *c,FrameScope &gate,bool bootstrapRead=false,bool *interfaceChanged=nullptr){
+ if(interfaceChanged)*interfaceChanged=false;
+ if(!c->interface || !gate.valid(c->display) ||
+    gate.connection!=c->connection || gate.frameService!=c->frame)return false;
  IOLockLock(hardwareQueue);bool retiring=c->retiring||c->reclaiming;IOLockUnlock(hardwareQueue);
  if(retiring)return false;
  OSObject *range=nullptr;
@@ -127,26 +215,26 @@ bool hardwareLive(HardwareSlot *c,FrameScope &gate,bool bootstrapRead=false){
  bool allowed=dbhw::allowsTransport(provider,c->initialized,range && range==c->boundRange,bootstrapRead);
  if(range)range->release();
  if(!allowed)return false;
- // Re-enumerate under this framebuffer's native gate; no stale interface cache.
- unsigned count=0;bool selected=false;
- auto *it=c->frame->getChildIterator(gIOServicePlane);
- if(it){while(auto *o=it->getNextObject()){
-  auto *candidate=OSDynamicCast(IOService,o);
-  if(candidate && hasClass(candidate,"IOFramebufferI2CInterface")){
-   ++count;if(candidate==c->interface)selected=true;
-  }
- }it->release();}
- if(!dbcompat::sameTopology(c->connection,gate.connection,c->frame,gate.frameService,count,selected))return false;
+ unsigned count=0;
+ auto *selected=copyUniqueActiveInterface(c->frame,count);
+ bool same=dbcompat::sameTopology(c->connection,gate.connection,c->frame,gate.frameService,count,selected==c->interface);
+ if(selected)selected->release();
+ if(!endpointEDIDMatches(c) || !gate.valid(c->display))return false;
  auto *parent=c->interface->copyParentEntry(gIOServicePlane);
- bool ok=hardwarePilot(c->display) && endpointEDIDMatches(c) && gate.valid(c->display) && gate.frameService==c->frame && parent==c->frame && !c->interface->isInactive();
- if(parent)parent->release();return ok;
+ bool ok=same && parent==c->frame && !c->interface->isInactive();
+ if(parent)parent->release();
+ if(interfaceChanged)*interfaceChanged=!ok && bootstrapRead && !c->initialized;
+ return ok;
 }
 // The caller holds bus serialization; scope releases native gate after each IO.
 bool hardwareIO(HardwareSlot *c,IOI2CRequest &q,const char *operation){
  FrameScope gate(c->display);
- if(!hardwareLive(c,gate,!strcmp(operation,"get-initial-brightness"))){
-  c->terminal=true;
-  c->display->setProperty("DisplayBrightnessHardwareState","offline-or-replaced");return false;
+ if(!cyclePermitted(c))return false;
+ bool interfaceChanged=false;
+ if(!hardwareLive(c,gate,!strcmp(operation,"get-initial-brightness"),&interfaceChanged)){
+  c->terminal=!interfaceChanged;
+  c->display->setProperty("DisplayBrightnessHardwareState",interfaceChanged?"waiting-interface-change":"offline-or-replaced");
+  return false;
  }
  // A Set must still permit a verified readback on the bound interface.
  if(c->replyMode.select(true,c->initialized)==dbhw::ReplyKind::Framed){
@@ -214,14 +302,14 @@ bool hardwareRead(HardwareSlot *c,dbddc::Brightness &b,const char *operation,boo
  auto read=[&](){++attempts;b=dbddc::Brightness{};return hardwareReadOnce(c,b,operation);};
  bool ok=false;
  if(responsive){
-  auto result=dbhw::responsiveRead(read,[](){IOSleep(10);},[&](){return !c->terminal;},[&](){
+  auto result=dbhw::responsiveRead(read,[](){IOSleep(10);},[&](){return !c->terminal&&cyclePermitted(c);},[&](){
    IOLockLock(hardwareQueue);
    bool obsolete=dbhw::differentPending(c->requests.pending,c->requests.desired,captured);
    IOLockUnlock(hardwareQueue);return obsolete;
   });
   c->superseded=result==dbhw::ReadResult::Superseded;ok=result==dbhw::ReadResult::Valid;
  }else{
-  ok=dbhw::readRecovery(read,[](){IOSleep(250);},[&](){return !c->terminal;});
+  ok=dbhw::readRecovery(read,[](){IOSleep(250);},[&](){return !c->terminal&&cyclePermitted(c);});
  }
  clock_get_uptime(&end);absolutetime_to_nanoseconds(end-begin,&ns);
  bool before=!strcmp(operation,"get-before-write"),after=!strcmp(operation,"get-after-write");
@@ -231,28 +319,31 @@ bool hardwareRead(HardwareSlot *c,dbddc::Brightness &b,const char *operation,boo
 }
 bool prepareBootstrapInterface(HardwareSlot *c){
  FrameScope gate(c->display);
+ if(!cyclePermitted(c))return false;
  if(!gate.valid(c->display)||!endpointEDIDMatches(c)||gate.connection!=c->connection||gate.frameService!=c->frame){c->terminal=true;return false;}
  if(brightnessProvider(c->display)==dbhw::BrightnessProvider::Foreign){
   c->terminal=true;
   c->display->setProperty("DisplayBrightnessBootstrapState","native-provider-preserved");
   return false;
  }
- if(c->interface)return true;
- IOService *iface=nullptr;unsigned count=0;
- auto *it=c->frame->getChildIterator(gIOServicePlane);
- if(it){while(auto *o=it->getNextObject()){
-  auto *candidate=OSDynamicCast(IOService,o);
-  if(candidate && hasClass(candidate,"IOFramebufferI2CInterface")){++count;if(!iface){iface=candidate;iface->retain();}}
- }it->release();}
- auto *o=iface?iface->copyProperty("IOI2CTransactionTypes"):nullptr;
- auto *types=OSDynamicCast(OSNumber,o);
- bool supported=dbhw::interfaceUsable(count,iface!=nullptr,iface && iface->isInactive(),types && (types->unsigned32BitValue()&(1U<<kIOI2CSimpleTransactionType)));
- if(o)o->release();
- if(supported){IOLockLock(hardwareQueue);c->interface=iface;IOLockUnlock(hardwareQueue);return true;}
- if(iface)iface->release();
- if(count>1)c->terminal=true;
- c->display->setProperty("DisplayBrightnessBootstrapState",count>1?"ambiguous-interface":"waiting-interface");
- return false;
+ unsigned count=0;
+ auto *iface=copyUniqueActiveInterface(c->frame,count);
+ auto *types=copyTransactionTypes(iface);
+ bool supported=dbhw::interfaceUsable(count,iface!=nullptr,iface && iface->isInactive(),supportsSimple(types));
+ if(types)types->release();
+ if(!supported && iface){iface->release();iface=nullptr;}
+ // Until publication, a transient topology change can settle within this
+ // slot's existing probe window. Forget reply mode if the interface changes.
+ IOLockLock(hardwareQueue);
+ auto *old=c->interface;
+ if(old!=iface)c->replyMode=dbhw::ReplyMode{};
+ c->interface=iface;
+ IOLockUnlock(hardwareQueue);
+ if(old)old->release();
+ c->display->setProperty("DisplayBrightnessI2CActiveCount",count,32);
+ if(!supported)
+  c->display->setProperty("DisplayBrightnessBootstrapState",count>1?"waiting-unambiguous-interface":"waiting-interface");
+ return supported;
 }
 bool initializeEndpoint(HardwareSlot *c){
  c->bootAttempt.phase=dbstate::BootstrapPhase::Interface;
@@ -273,8 +364,14 @@ bool initializeEndpoint(HardwareSlot *c){
   }
   c->bootAttempt.phase=dbstate::BootstrapPhase::Publish;
   FrameScope gate(c->display);
-  if(!hardwareLive(c,gate,true)){c->terminal=true;return false;}
-  publish(c->display,true,value);publishEDMMarker(c->display);
+  if(!cyclePermitted(c))return false;
+  bool interfaceChanged=false;
+  if(!hardwareLive(c,gate,true,&interfaceChanged)){
+   c->terminal=!interfaceChanged;
+   if(interfaceChanged)c->display->setProperty("DisplayBrightnessBootstrapState","waiting-interface-change");
+   return false;
+  }
+  publish(c->display,value);publishEDMMarker(c->display);
   OSObject *range=nullptr;
   auto provider=brightnessProvider(c->display,&range);
   if(!range){
@@ -347,7 +444,7 @@ void syncVerifiedState(HardwareSlot *c,UInt64 sequence){
  bool changed=false;
  {
   FrameScope gate(c->display);
-  if(!hardwareLive(c,gate))return;
+  if(!cyclePermitted(c)||!hardwareLive(c,gate))return;
   // Same lock order as submission: native framebuffer gate, then queue lock.
   IOLockLock(hardwareQueue);
   if(dbstate::mayPublish(sequence,c->sequence,c->requests.pending,true)){
@@ -420,11 +517,17 @@ void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  }
  if(c->display->isInactive()){
   c->requests.stop();busAdmission.forget(slot);
-  IOLockUnlock(hardwareQueue);return;
+  bool retire=retireCall && dbhw::markInactiveForRetirement(true,c->retiring);
+  IOLockUnlock(hardwareQueue);
+  if(retire)thread_call_enter(retireCall);
+  return;
  }
+ c->requests.waitingForRetry=false;
+ if(!c->updateGuard.ready(startedNs)){deferHardware(c);IOLockUnlock(hardwareQueue);return;}
+ c->cycleGeneration=c->updateGuard.generation;c->deferred=false;guardState(c,startedNs);
  bool initialized=c->initialized;
- if(!initialized)c->bootstrapWindow.observe(startedNs);
- if(!busAdmission.acquire(slot)){
+ auto admission=dbhw::admitVisit(busAdmission,slot,c->bootstrapWindow,initialized,startedNs);
+ if(admission==dbhw::VisitAdmission::Parked){
   if(!c->busWaitSinceNs)c->busWaitSinceNs=startedNs;
   c->display->setProperty("DisplayBrightnessHardwareState","waiting-for-bus");
   // Leave the target pending. No sleeping callback or polling timer.
@@ -441,9 +544,7 @@ void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  const char *metrics[]={"DisplayBrightnessBeforeReadMicroseconds","DisplayBrightnessAfterReadMicroseconds","DisplayBrightnessBeforeReadAttempts","DisplayBrightnessAfterReadAttempts","DisplayBrightnessSetMicroseconds"};
  for(const char *key:metrics)c->display->setProperty(key,static_cast<UInt64>(0),64);
  if(!initialized)c->bootAttempt=dbstate::BootstrapAttempt{};
- uint64_t acquired=0,acquiredNs=0;
- clock_get_uptime(&acquired);absolutetime_to_nanoseconds(acquired,&acquiredNs);
- bool bootAllowed=initialized||c->bootstrapWindow.begin(acquiredNs);
+ bool bootAllowed=admission==dbhw::VisitAdmission::Ready;
  bool ok=false;
  if(!bootAllowed){
   c->terminal=true;c->bootAttempt.phase=dbstate::BootstrapPhase::Exhausted;
@@ -455,13 +556,15 @@ void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  }
  releaseHardwareBus(slot);
  clock_get_uptime(&finished);absolutetime_to_nanoseconds(finished-started,&elapsed);
- if(!initialized&&bootAllowed)recordBootstrapAttempt(c,ok,started,finished);
+ if(!initialized&&bootAllowed&&!c->deferred)recordBootstrapAttempt(c,ok,started,finished);
+ if(!initialized&&c->deferred&&!c->bootAttempt.attempted&&c->bootstrapWindow.rounds)
+  --c->bootstrapWindow.rounds;
  c->display->setProperty("DisplayBrightnessHardwareCycleMicroseconds",elapsed/1000,64);
  c->display->setProperty("DisplayBrightnessHardwareCycleSequence",sequence,64);
  if(ok && c->initialized)syncVerifiedState(c,sequence);
  // Deadline bounds new startup attempts, not an in-flight synchronous AMD call.
  UInt64 finishedNs=0;absolutetime_to_nanoseconds(finished,&finishedNs);
- if(!initialized&&!ok&&!c->terminal&&!c->bootstrapWindow.maySchedule(finishedNs)){
+ if(!initialized&&!ok&&!c->terminal&&!c->deferred&&!c->bootstrapWindow.maySchedule(finishedNs)){
   c->terminal=true;
   c->display->setProperty("DisplayBrightnessBootstrapState","probe-window-exhausted-reconnect-required");
  }
@@ -470,18 +573,30 @@ void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  bool live=!c->terminal && hardwarePilot(c->display);
  IOLockLock(hardwareQueue);
  live=live && !c->retiring && !c->reclaiming;
- if(!live)c->requests.stop();
- bool yielded=c->superseded&&live;
+ if(live&&(c->deferred||!c->updateGuard.permits(hardwareNowNs(),c->cycleGeneration))){
+  deferHardware(c,!initialized&&c->initialized);IOLockUnlock(hardwareQueue);return;
+ }
+ bool retireNeeded=false;
+ if(!live){
+  c->requests.stop();
+  if(retireCall)retireNeeded=dbhw::markInactiveForRetirement(c->display->isInactive(),c->retiring);
+ }
+ bool newTarget=c->requests.hasNewTarget();
+ bool yielded=c->superseded&&live&&newTarget;
  if(yielded)c->display->setProperty("DisplayBrightnessHardwareState","superseded-unverified");
  const bool reschedule=live && c->requests.complete(ok||yielded,initialized,bootSettings.retries);
  if(live && initialized && !ok && !yielded && !reschedule)
   c->display->setProperty("DisplayBrightnessHardwareState","request-retries-exhausted");
  if(reschedule){
-  uint64_t deadline;clock_interval_to_deadline((ok||yielded)?bootSettings.coalesceMs:(initialized?2000:c->bootstrapWindow.cadenceMs),kMillisecondScale,&deadline);
-  if(!ok&&!yielded)c->display->setProperty("DisplayBrightnessHardwareState",initialized?"recovering-read-before-write":"probe-cooldown");
+  bool coalesce=ok || (initialized && newTarget);
+  unsigned delay=coalesce?bootSettings.coalesceMs:(initialized?2000:c->bootstrapWindow.cadenceMs);
+  uint64_t deadline;clock_interval_to_deadline(delay,kMillisecondScale,&deadline);
+  if(!coalesce)c->display->setProperty("DisplayBrightnessHardwareState",initialized?"recovering-read-before-write":"probe-cooldown");
+  c->requests.waitingForRetry=initialized && !coalesce;
   thread_call_enter_delayed(c->call,deadline);
  }
  IOLockUnlock(hardwareQueue);
+ if(retireNeeded)thread_call_enter(retireCall);
 }
 void endpointSnapshot(IOService *s,const char *reason,unsigned interfaces){
  // Caller holds hardwareQueue; snapshots carry registry IDs, never kernel pointers.
@@ -503,6 +618,7 @@ void endpointSnapshot(IOService *s,const char *reason,unsigned interfaces){
   item->setObject("busy",c.requests.busy?kOSBooleanTrue:kOSBooleanFalse);
   item->setObject("pending",c.requests.pending?kOSBooleanTrue:kOSBooleanFalse);
   item->setObject("failed",c.requests.failed?kOSBooleanTrue:kOSBooleanFalse);
+  item->setObject("waitingForRetry",c.requests.waitingForRetry?kOSBooleanTrue:kOSBooleanFalse);
   put(item,"desired",c.requests.desired);
   char key[16];snprintf(key,sizeof(key),"slot%u",i);
   d->setObject(key,item);item->release();
@@ -514,25 +630,23 @@ dbhw::Refresh refreshEndpoint(HardwareSlot *c,IOService *s,IOService *fb){
  auto *connection=s->copyParentEntry(gIOServicePlane);
  bool sameBinding=c->frame==fb && c->connection==connection && endpointEDIDMatches(c);
  if(connection)connection->release();
- unsigned count=0;IOService *selected=nullptr;
- auto *it=fb->getChildIterator(gIOServicePlane);
- if(it){while(auto *o=it->getNextObject()){
-  auto *candidate=OSDynamicCast(IOService,o);
-  if(candidate && hasClass(candidate,"IOFramebufferI2CInterface")){++count;if(!selected){selected=candidate;selected->retain();}}
- }it->release();}
- auto *types=selected?selected->copyProperty("IOI2CTransactionTypes"):nullptr;
- auto *number=OSDynamicCast(OSNumber,types);
- bool supported=dbhw::interfaceUsable(count,selected!=nullptr,selected && selected->isInactive(),number &&
-  (number->unsigned32BitValue()&(1U<<kIOI2CSimpleTransactionType)));
- // Absent/ambiguous/unsupported resources do not renew an uninitialized probe.
- bool sameInterface=c->interface ? (supported && selected==c->interface) : !supported;
- if(types)types->release();if(selected)selected->release();
  OSObject *range=nullptr;
  auto provider=brightnessProvider(s,&range);
- auto result=dbhw::endpointRefresh(c->initialized,c->requests.stopped,sameBinding,
-  sameInterface,range && range==c->boundRange,provider==dbhw::BrightnessProvider::Foreign,modeRefreshRequested);
+ bool sameRange=range && range==c->boundRange;
  if(range)range->release();
- return result;
+ bool sameInterface=true,usableInterface=false;
+ if(modeRefreshRequested || c->requests.stopped || (c->initialized && sameBinding && sameRange)){
+  unsigned count=0;
+  auto *selected=copyUniqueActiveInterface(fb,count);
+  auto *types=copyTransactionTypes(selected);
+  usableInterface=dbhw::interfaceUsable(count,selected!=nullptr,selected && selected->isInactive(),supportsSimple(types));
+  // Absent/ambiguous/unsupported resources do not renew an uninitialized probe.
+  sameInterface=c->interface ? (usableInterface && selected==c->interface) : !usableInterface;
+  if(types)types->release();if(selected)selected->release();
+ }
+ return dbhw::endpointRefresh(c->initialized,c->requests.stopped,sameBinding,
+  sameInterface,sameRange,provider==dbhw::BrightnessProvider::Foreign,
+  modeRefreshRequested,c->requests.busy && !c->requests.stopped,usableInterface);
 }
 bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=false){
  // Called inside the native gate; no bus operations here.
@@ -554,8 +668,9 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
    if(!candidate.retiring && bootstrap && retireCall){
     auto refresh=dbhw::Refresh::Keep;
     if(foreign)refresh=dbhw::Refresh::Retire;
-    else if(modeRefreshRequested && admissionCall)refresh=refreshEndpoint(&candidate,s,fb);
-    if(refresh==dbhw::Refresh::Reprobe && !rememberBootstrap(s,fb,true)){
+    else if(admissionCall && (modeRefreshRequested || candidate.initialized || candidate.requests.stopped))
+     refresh=refreshEndpoint(&candidate,s,fb);
+    if(refresh==dbhw::Refresh::Reprobe && !rememberBootstrap(s,fb,modeRefreshRequested)){
      recoveryTicketFull=true;
     }else if(refresh!=dbhw::Refresh::Keep){
      candidate.retiring=true;retireNeeded=true;
@@ -572,7 +687,8 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
     if(bootstrap && modeRefreshRequested && candidate.recoveryReadmit)recovery=true;
    }else slot=&candidate;
   }
-  retirementPending=retirementPending||candidate.retiring;
+  retirementPending=retirementPending||dbhw::retirementExpected(candidate.display!=nullptr,
+   candidate.display && candidate.display->isInactive(),candidate.retiring);
   if(index<bootSettings.slots && !candidate.retiring && !candidate.display && !empty)empty=&candidate;
  }
  if(foreign || recoveryTicketFull){
@@ -584,19 +700,13 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
   return false;
  }
  if(!slot && empty && !matchingRetiring){
-  IOService *iface=nullptr;unsigned count=0;
-  reason="interface-iterator-unavailable";
-  OSIterator *it=fb->getChildIterator(gIOServicePlane);
-  if(it){while(auto *o=it->getNextObject()){
-   auto *p=OSDynamicCast(IOService,o);
-   if(p && hasClass(p,"IOFramebufferI2CInterface")){++count;if(!iface){iface=p;iface->retain();}}
-  }it->release();}
+  unsigned count=0;bool enumerated=false;
+  auto *iface=copyUniqueActiveInterface(fb,count,&enumerated);
   interfaceCount=count;
-  if(it)reason=count==0?"interface-not-ready":(count!=1?"ambiguous-interface":"missing-transaction-types");
-  OSObject *types=iface?iface->copyProperty("IOI2CTransactionTypes"):nullptr;
-  auto *n=OSDynamicCast(OSNumber,types);
-  bool supported=dbhw::interfaceUsable(count,iface!=nullptr,iface && iface->isInactive(),n && (n->unsigned32BitValue()&(1U<<kIOI2CSimpleTransactionType)));
-  if(n && count==1)reason=supported?"thread-call-allocation-failed":"unsupported-transaction";
+  reason=enumerated?(count==0?"interface-not-ready":(count!=1?"ambiguous-interface":"missing-transaction-types")):"interface-iterator-unavailable";
+  auto *types=copyTransactionTypes(iface);
+  bool supported=dbhw::interfaceUsable(count,iface!=nullptr,iface && iface->isInactive(),supportsSimple(types));
+  if(types && count==1)reason=supported?"thread-call-allocation-failed":"unsupported-transaction";
   if(types)types->release();
   if(supported || bootstrap){
    if(!empty->call)empty->call=thread_call_allocate_with_priority(hardwareWorker,empty,THREAD_CALL_PRIORITY_LOW);
@@ -608,6 +718,10 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
      empty->bootstrapWindow.configure(bootSettings.probeWindow(recovery),bootSettings.startupIntervalMs);
      empty->connection=connection;connection=nullptr;
      empty->display=s;empty->frame=fb;empty->interface=supported?iface:nullptr;
+     empty->updateGuard.begin();empty->updateGuard.end(hardwareNowNs());
+     for(auto *update=displayUpdates;update;update=update->next)
+      if(update->display==s)empty->updateGuard.begin();
+     guardState(empty,hardwareNowNs());
      s->retain();fb->retain();slot=empty;if(supported)iface=nullptr;
     }
     if(parent)parent->release();if(connection)connection->release();
@@ -628,6 +742,9 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
  bool ok=slot && (bootstrap || slot->initialized) && slot->frame==fb && slot->requests.submit(desired,schedule);
  if(ok){
   slot->sequence=nextEvent();
+  // Nonblocking cancel only: never wait on a callback from either lock.
+  if(!schedule && !bootstrap)
+   schedule=slot->requests.advanceRetry([&](){return thread_call_cancel(slot->call);});
   if(schedule){
    bool recoveryStart=bootstrap && slot->recoveryProbe;
    unsigned delay=bootSettings.initialProbeDelay(recoveryStart);

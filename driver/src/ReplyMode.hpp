@@ -7,7 +7,6 @@ enum class ReplyKind { Simple, Framed, Unavailable };
 // the current one. After publication, keep the mode that was verified.
 class ReplyMode {
     ReplyKind preferred = ReplyKind::Simple;
-    bool framedFailed = false;
 
 public:
     ReplyKind select(bool framedAdvertised, bool initialized) const {
@@ -21,9 +20,7 @@ public:
             preferred = attempted;
             return;
         }
-        if (attempted == ReplyKind::Framed)
-            framedFailed = true;
-        preferred = framedFailed ? ReplyKind::Simple : ReplyKind::Framed;
+        preferred = attempted == ReplyKind::Simple ? ReplyKind::Framed : ReplyKind::Simple;
     }
 };
 }

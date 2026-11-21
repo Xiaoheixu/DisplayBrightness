@@ -10,6 +10,7 @@
 !/driver/Info.plist
 !/driver/build.sh
 !/driver/ExportBootLog.command
+!/driver/diagnostic-filter.awk
 !/driver/src/
 !/driver/tests/
 .DS_Store

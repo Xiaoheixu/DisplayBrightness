@@ -1,6 +1,10 @@
 #!/bin/bash
 # Read-only compatibility survey. Output is limited to selected fields.
 set -u
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${1:-}" = --filter-ioreg ]]; then
+    exec /usr/bin/awk -f "$script_dir/diagnostic-filter.awk"
+fi
 umask 077
 export LC_ALL=C
 show_finder=true
@@ -68,7 +72,7 @@ binary="$graphics/IOGraphicsFamily"
     echo
     echo '[DisplayBrightness plugin state]'
     /usr/sbin/ioreg -r -c IOPlatformExpertDevice -d 1 -l -w 0 2>/dev/null |
-        /usr/bin/awk '/"DisplayBrightness(RequestProbeRouting|RequestProbeVersion|GraphicsProfile|StartupMode|HDRRecoveryEnabled)" =/'
+        /usr/bin/awk -f "$script_dir/diagnostic-filter.awk"
     echo
     echo '[Display class counts; system-wide]'
     for display_class in AppleDisplay AppleBacklightDisplay IOFramebufferI2CInterface; do
@@ -81,15 +85,12 @@ binary="$graphics/IOGraphicsFamily"
     done
     echo
     echo '[Current framebuffer topology and selected display state]'
-    /usr/sbin/ioreg -r -c IOFramebuffer -d 3 -l -w 0 |
-        /usr/bin/awk '
-            /^\+-o |\+-o .*<class (IOFramebufferI2CInterface|IODisplayConnect|AppleBacklightDisplay|AppleDisplay),/ { print; next }
-            /"(IOI2CTransactionTypes|DisplayBrightness(BootstrapState|BootstrapAttemptCount|HardwareState|HardwareOperation|HardwareReplyType|HardwareActual|HardwareMaximum|HardwareTransportResult|HardwareRequestResult|EndpointRefresh))" =/ { print }
-        '
+    /usr/sbin/ioreg -r -c IOFramebuffer -i -d 3 -l -w 0 |
+        /usr/bin/awk -f "$script_dir/diagnostic-filter.awk"
     echo
-    echo '[macOS startup logs from the past 24 hours]'
+    echo '[DisplayBrightness and GPU hang/reset logs from the past 24 hours]'
     /usr/bin/log show --last 24h --style compact --info \
-        --predicate '(process == "kernel" OR process == "kernelmanagerd") AND eventMessage CONTAINS[c] "DisplayBrightness"' ||
+        --predicate '((process == "kernel" OR process == "kernelmanagerd") AND eventMessage CONTAINS[c] "DisplayBrightness") OR (process == "kernel" AND (eventMessage CONTAINS[c] "GPU hang:" OR eventMessage CONTAINS[c] "GPU Reset"))' ||
         echo 'Unable to read macOS logs. See the error above.'
     echo 'Missing DBBOOT entries may mean that logging was disabled, the kext entry did not run, or the system did not save the records.'
     if [[ -n "$oc_file" ]]; then

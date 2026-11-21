@@ -19,7 +19,7 @@ compile(){
  xcrun clang++ -arch x86_64 -std=c++14 -mkernel -fapple-kext -fno-exceptions -fno-rtti \
  -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -nostdinc -nostdinc++ -Wall -Wextra -Wno-unused-parameter -fno-stack-protector \
  -isysroot "$sdk" -I "$headers" -I "$headers/bsd" -I "$lilu" -I src \
- -DKERNEL -DKERNEL_PRIVATE -DPRODUCT_NAME=DisplayBrightness -DMODULE_VERSION=0.0.38 \
+ -DKERNEL -DKERNEL_PRIVATE -DPRODUCT_NAME=DisplayBrightness -DMODULE_VERSION=0.0.45 \
  "$@" -c "$source" -o "$object"
 }
 compile src/Plugin.cpp "$build_dir/Plugin.o" "$@" >"$build_dir/Plugin.log" 2>&1
@@ -83,7 +83,7 @@ xcrun clang++ -std=c++14 -Wall -Wextra -Werror -fsanitize=address,undefined -I s
 
 
 
-for test in generic-identity compatibility topology vendor-invariance bootstrap-journal bootstrap-window bootstrap-reply endpoint-refresh bus-admission provider-policy boot-settings; do
+for test in retirement-admission display-update-guard generic-identity compatibility topology vendor-invariance bootstrap-journal bootstrap-window bootstrap-reply endpoint-refresh bus-admission provider-policy boot-settings; do
  xcrun clang++ -std=c++14 -Wall -Wextra -Werror -fsanitize=address,undefined -I src "tests/$test-test.cpp" -o "$build_dir/$test-test"
  "$build_dir/$test-test"
 done
@@ -92,3 +92,5 @@ python3 tests/check-brightness-only.py
 
 xcrun clang++ -std=c++14 -Wall -Wextra -Werror -I src tests/reply-mode-test.cpp -o "$build_dir/reply-mode-test"
 "$build_dir/reply-mode-test"
+
+python3 tests/diagnostic-export-test.py

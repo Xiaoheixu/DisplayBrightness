@@ -4,6 +4,13 @@
 
 DisplayBrightness is an OpenCore-loaded Lilu plugin that adds native macOS brightness control to compatible external monitors. Use **System Settings → Displays**, **Control Center**, or the system brightness keys to adjust the monitor's hardware brightness through DDC/CI. Normal operation requires only the kext and Lilu.
 
+## Changes in 0.0.45
+
+- Defers DDC during display updates and for two seconds afterward, retaining the latest target and requiring a fresh read on resume.
+- Improves bounded startup probing, usable-interface recovery, and admission after disconnected endpoints release their slots.
+- Brings a pending failure retry forward for a different brightness target while preserving the same-target retry limit.
+- Exports bounded raw replies, request and target values, readback results, endpoint snapshots and deferral state. Keep `ExportBootLog.command` beside `diagnostic-filter.awk`.
+
 ## How it works
 
 1. The plugin checks the Darwin version and x86_64 IOGraphics UUID before installing its display parameter hooks.
